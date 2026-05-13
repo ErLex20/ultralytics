@@ -80,7 +80,7 @@ from ultralytics.data import build_dataloader
 from ultralytics.data.dataset import YOLODataset
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
 from ultralytics.nn.autobackend import check_class_names, default_class_names
-from ultralytics.nn.modules import C2f, Classify, Detect, RTDETRDecoder, Segment26
+from ultralytics.nn.modules import C2f, Classify, Detect, DetectDLA, RTDETRDecoder, Segment26, SegmentDLA
 from ultralytics.nn.tasks import ClassificationModel, DetectionModel, SegmentationModel, WorldModel
 from ultralytics.utils import (
     ARM64,
@@ -621,7 +621,16 @@ class Exporter:
             assert TORCH_1_13, f"'nms=True' ONNX export requires torch>=1.13 (found torch=={TORCH_VERSION})"
 
         f = str(self.file.with_suffix(".onnx"))
-        output_names = ["output0", "output1"] if self.model.task == "segment" else ["output0"]
+        # DLA-headless heads emit one packed 4-D tensor per scale (+ proto for seg).
+        # Override the default 1-or-2-output naming with explicit per-scale names so
+        # the deployment binding table is readable instead of `output0` / `498` / `511`.
+        head = self.model.model[-1] if hasattr(self.model, "model") else None
+        if isinstance(head, SegmentDLA):
+            output_names = [f"pred_p{i + 3}" for i in range(head.nl)] + ["proto"]
+        elif isinstance(head, DetectDLA):
+            output_names = [f"pred_p{i + 3}" for i in range(head.nl)]
+        else:
+            output_names = ["output0", "output1"] if self.model.task == "segment" else ["output0"]
         dynamic = self.args.dynamic
         if dynamic:
             dynamic = {"images": {0: "batch", 2: "height", 3: "width"}}  # shape(1,3,640,640)

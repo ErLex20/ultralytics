@@ -1,24 +1,29 @@
-"""External decode for the headless DLA-exported YOLO11 engine.
+"""External decode for the DLA-exported YOLO11 engine (packed-channel layout).
 
-The DLA-compatible head (`DetectDLA` / `SegmentDLA` in export mode) emits raw
-4-D feature maps so every op in the engine stays DLA-compatible. The decode
-that was previously baked into the engine (DFL → dist2bbox → sigmoid → flatten)
-must therefore run externally on GPU after the engine returns.
+The DLA-compatible head (`DetectDLA` / `SegmentDLA` in export mode) packs all
+per-anchor predictions for each pyramid scale into one 4-D tensor so every op
+in the engine stays DLA-compatible. The decode that was previously baked into
+the engine (DFL → dist2bbox → sigmoid → flatten) must therefore run externally
+on GPU after the engine returns.
 
-Engine output order for `SegmentDLA` (10 tensors):
+Engine output order:
 
-    0: box_P3         (B, 4*reg_max, H_P3, W_P3)   # e.g. (1, 64, 64, 64)
-    1: score_P3       (B, nc,         H_P3, W_P3)   # e.g. (1, 80, 64, 64)
-    2: box_P4         (B, 4*reg_max, H_P4, W_P4)
-    3: score_P4       (B, nc,         H_P4, W_P4)
-    4: box_P5         (B, 4*reg_max, H_P5, W_P5)
-    5: score_P5       (B, nc,         H_P5, W_P5)
-    6: proto          (B, nm,        2*H_P3, 2*W_P3)
-    7: mask_P3        (B, nm,         H_P3, W_P3)
-    8: mask_P4        (B, nm,         H_P4, W_P4)
-    9: mask_P5        (B, nm,         H_P5, W_P5)
+    DetectDLA  (3 outputs):
+        pred_p3  (B, 4*reg_max + nc, H_P3, W_P3)         # e.g. (1, 144, 64, 64)
+        pred_p4  (B, 4*reg_max + nc, H_P4, W_P4)         # e.g. (1, 144, 32, 32)
+        pred_p5  (B, 4*reg_max + nc, H_P5, W_P5)         # e.g. (1, 144, 16, 16)
 
-For `DetectDLA` the engine returns only outputs 0-5.
+    SegmentDLA (4 outputs):
+        pred_p3  (B, 4*reg_max + nc + nm, H_P3, W_P3)    # e.g. (1, 176, 64, 64)
+        pred_p4  (B, 4*reg_max + nc + nm, H_P4, W_P4)    # e.g. (1, 176, 32, 32)
+        pred_p5  (B, 4*reg_max + nc + nm, H_P5, W_P5)    # e.g. (1, 176, 16, 16)
+        proto    (B, nm, 2*H_P3, 2*W_P3)                  # e.g. (1, 32, 128, 128)
+
+Per scale, channels are packed in the order  `[box | score | mask]`:
+
+    box   = pred[:,                       :  4*reg_max         , :, :]
+    score = pred[:,  4*reg_max            :  4*reg_max + nc     , :, :]
+    mask  = pred[:,  4*reg_max + nc       :  4*reg_max + nc + nm, :, :]
 
 Run `python dla_decode.py --verify` to check numerical parity against the
 standard 3-D `Detect._inference` path on a synthetic input.
@@ -31,34 +36,57 @@ import argparse
 import torch
 
 
+def unpack_scale(
+    pred: torch.Tensor,
+    reg_max: int,
+    nc: int,
+    nm: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Split a packed per-scale tensor into (box, score, mask) on the channel axis."""
+    box = pred[:, : 4 * reg_max]
+    score = pred[:, 4 * reg_max : 4 * reg_max + nc]
+    mask = pred[:, 4 * reg_max + nc : 4 * reg_max + nc + nm] if nm else None
+    return box, score, mask
+
+
 def decode_heads(
-    boxes_per_scale: list[torch.Tensor],
-    scores_per_scale: list[torch.Tensor],
+    preds_per_scale: list[torch.Tensor],
     strides: torch.Tensor,
     reg_max: int = 16,
     nc: int = 80,
-) -> torch.Tensor:
-    """Decode the 6 raw 4-D heads from a headless engine into `(B, 4+nc, num_anchors)`.
+    nm: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Decode the 3 packed 4-D heads into `(B, 4+nc, total_anchors)` (+ mask coeffs).
 
     Args:
-        boxes_per_scale: list of 3 box maps, each `(B, 4*reg_max, H_i, W_i)`.
-        scores_per_scale: list of 3 score maps, each `(B, nc, H_i, W_i)`.
+        preds_per_scale: list of 3 packed maps, each `(B, 4*reg_max + nc + nm, H_i, W_i)`.
         strides: tensor of strides per scale, e.g. `torch.tensor([8., 16., 32.])`.
-        reg_max: DFL bin count (16 for YOLO11-n).
+        reg_max: DFL bin count.
         nc: number of classes.
+        nm: number of mask prototypes (0 for detection, 32 for segmentation).
 
     Returns:
-        `(B, 4+nc, total_anchors)` — xywh box centres followed by class probabilities.
+        `(dets, mask_coeff)` where
+            dets       = `(B, 4 + nc, total_anchors)` — xywh box centres + class probs.
+            mask_coeff = `(B, nm, total_anchors)` or `None` if `nm == 0`.
     """
     from ultralytics.utils.tal import dist2bbox, make_anchors
 
-    bs = boxes_per_scale[0].shape[0]
-    device, dtype = boxes_per_scale[0].device, boxes_per_scale[0].dtype
+    bs = preds_per_scale[0].shape[0]
+    device, dtype = preds_per_scale[0].device, preds_per_scale[0].dtype
 
-    anchors, strides_t = (a.transpose(0, 1) for a in make_anchors(boxes_per_scale, strides, 0.5))
+    boxes_4d, scores_4d, masks_4d = [], [], []
+    for p in preds_per_scale:
+        box, score, mask = unpack_scale(p, reg_max, nc, nm)
+        boxes_4d.append(box)
+        scores_4d.append(score)
+        if mask is not None:
+            masks_4d.append(mask)
 
-    boxes_flat = torch.cat([b.view(bs, 4 * reg_max, -1) for b in boxes_per_scale], dim=-1)
-    scores_flat = torch.cat([s.view(bs, nc, -1) for s in scores_per_scale], dim=-1)
+    anchors, strides_t = (a.transpose(0, 1) for a in make_anchors(boxes_4d, strides, 0.5))
+
+    boxes_flat = torch.cat([b.view(bs, 4 * reg_max, -1) for b in boxes_4d], dim=-1)
+    scores_flat = torch.cat([s.view(bs, nc, -1) for s in scores_4d], dim=-1)
 
     b, _, a = boxes_flat.shape
     dist = boxes_flat.view(b, 4, reg_max, a).softmax(2)
@@ -66,16 +94,12 @@ def decode_heads(
     dist = (dist * dfl_w).sum(2)
 
     dbox = dist2bbox(dist, anchors.unsqueeze(0), xywh=True, dim=1) * strides_t
-    return torch.cat([dbox, scores_flat.sigmoid()], dim=1)
+    dets = torch.cat([dbox, scores_flat.sigmoid()], dim=1)
 
-
-def decode_masks(
-    masks_per_scale: list[torch.Tensor],
-    nm: int = 32,
-) -> torch.Tensor:
-    """Flatten + concat the 3 mask-coefficient feature maps into `(B, nm, num_anchors)`."""
-    bs = masks_per_scale[0].shape[0]
-    return torch.cat([m.view(bs, nm, -1) for m in masks_per_scale], dim=-1)
+    if masks_4d:
+        mask_coeff = torch.cat([m.view(bs, nm, -1) for m in masks_4d], dim=-1)
+        return dets, mask_coeff
+    return dets, None
 
 
 def _verify() -> None:
@@ -92,26 +116,22 @@ def _verify() -> None:
 
     head.export = False
     with torch.no_grad():
-        (y_ref, _proto_ref), _preds = model(x)
+        (y_ref, proto_ref), _preds = model(x)
     head.export = True
     with torch.no_grad():
         outs = model(x)
     head.export = False
 
-    boxes_per_scale = [outs[0], outs[2], outs[4]]
-    scores_per_scale = [outs[1], outs[3], outs[5]]
-    proto_dla = outs[6]
-    masks_per_scale = [outs[7], outs[8], outs[9]]
-
-    y_dla = decode_heads(boxes_per_scale, scores_per_scale, head.stride, reg_max=head.reg_max, nc=head.nc)
-    mask_coeff_dla = decode_masks(masks_per_scale, nm=head.nm)
-    y_dla_full = torch.cat([y_dla, mask_coeff_dla], dim=1)
+    preds_per_scale = list(outs[:3])
+    proto_dla = outs[3]
+    dets, mask_coeff = decode_heads(preds_per_scale, head.stride, reg_max=head.reg_max, nc=head.nc, nm=head.nm)
+    y_dla_full = torch.cat([dets, mask_coeff], dim=1)
 
     diff = (y_ref - y_dla_full).abs()
     print(f"Reference shape:  {tuple(y_ref.shape)}")
     print(f"DLA-decoded shape: {tuple(y_dla_full.shape)}")
     print(f"Max abs diff: {diff.max().item():.3e}   Mean abs diff: {diff.mean().item():.3e}")
-    proto_diff = (_proto_ref - proto_dla).abs().max().item()
+    proto_diff = (proto_ref - proto_dla).abs().max().item()
     print(f"Proto max abs diff: {proto_diff:.3e}")
     if diff.max().item() < 1e-4 and proto_diff < 1e-4:
         print("PASS — external decode matches in-engine decode")

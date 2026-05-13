@@ -415,14 +415,18 @@ class Segment26(Segment):
 
 
 class DetectDLA(Detect):
-    """Detect head for DLA-only engines: returns raw 4-D feature maps in export mode.
+    """Detect head for DLA-only engines: emits one packed 4-D tensor per scale.
 
     Training and Python-inference paths are unchanged (standard 3-D `Detect` path).
-    Export mode emits a flat tuple of `(B, C, H_i, W_i)` tensors — 3 box maps and 3
-    score maps — so every op from input to engine output stays strictly 4-D and
-    DLA-compatible. DFL decode, dist2bbox, anchor decode, sigmoid, and NMS must be
-    done by external code on GPU after the engine returns; see
-    `tools/ultralytics/examples/dla_decode.py` for a reference implementation.
+    Export mode emits **3 outputs** — one per scale — with `box` and `score`
+    concatenated along the channel axis: `(B, 4·reg_max + nc, H_i, W_i)`. Every
+    op from input to engine output stays 4-D and DLA-compatible (channel-axis
+    `Concat` on NCHW tensors is supported by DLA).
+
+    DFL decode, dist2bbox, anchor decode, sigmoid, and NMS must be done by
+    external code on GPU after the engine returns; see
+    `tools/ultralytics/examples/dla_decode.py` for a reference implementation
+    that slices the packed channels back into `box` / `score` before decoding.
 
     The earlier "defer-flatten-until-the-end" approach was structurally unable to
     land the head on DLA: the final `torch.cat(..., dim=2)` produced a 3-D tensor,
@@ -432,34 +436,41 @@ class DetectDLA(Detect):
     """
 
     def forward(self, x: list[torch.Tensor]):
-        """Export: tuple of 6 raw 4-D heads. Otherwise: standard Detect path."""
+        """Export: 3 packed 4-D heads (one per scale). Otherwise: standard Detect path."""
         if self.export:
             return self._export_4d(x)
         return super().forward(x)
 
     def _export_4d(self, feats: list[torch.Tensor]) -> tuple[torch.Tensor, ...]:
-        """Emit 3 box + 3 score 4-D feature maps per scale for headless DLA export.
+        """Emit one `(B, 4·reg_max + nc, H_i, W_i)` tensor per scale (packed box+score).
 
-        Output order: (box_P3, score_P3, box_P4, score_P4, box_P5, score_P5),
-        all `(B, C, H_i, W_i)`.
+        Output order: `(pred_p3, pred_p4, pred_p5)` for `feats` at strides 8, 16, 32.
         """
         box_head = self.one2one_cv2 if self.end2end else self.cv2
         cls_head = self.one2one_cv3 if self.end2end else self.cv3
         out: list[torch.Tensor] = []
         for i in range(self.nl):
-            out.append(box_head[i](feats[i]))   # (B, 4*reg_max, H_i, W_i)
-            out.append(cls_head[i](feats[i]))   # (B, nc,        H_i, W_i)
+            box = box_head[i](feats[i])    # (B, 4*reg_max, H_i, W_i)
+            score = cls_head[i](feats[i])  # (B, nc,        H_i, W_i)
+            out.append(torch.cat([box, score], dim=1))  # (B, 4*reg_max + nc, H_i, W_i)
         return tuple(out)
 
 
 class SegmentDLA(DetectDLA):
-    """Segment head for DLA-only engines: returns raw 4-D feature maps in export mode.
+    """Segment head for DLA-only engines: emits one packed tensor per scale + proto.
 
     Training and Python-inference paths mirror standard `Segment` (3-D decode on GPU).
-    Export mode emits a flat tuple of 10 `(B, C, H, W)` tensors:
-        (box_P3, score_P3, box_P4, score_P4, box_P5, score_P5, proto, mask_P3, mask_P4, mask_P5)
-    `proto` has shape `(B, nm, 2·H_P3, 2·W_P3)`; the three mask coefficient maps have
-    shape `(B, nm, H_i, W_i)`. Decode and NMS happen externally on GPU; see
+    Export mode emits **4 outputs**, all 4-D and all DLA-compatible:
+
+        pred_p3  (B, 4·reg_max + nc + nm, 64,  64)
+        pred_p4  (B, 4·reg_max + nc + nm, 32,  32)
+        pred_p5  (B, 4·reg_max + nc + nm, 16,  16)
+        proto    (B, nm,                 128, 128)
+
+    Per scale, `box` (from `cv2`), `score` (from `cv3`), and `mask_coefficient`
+    (from `cv4`) are concatenated along the channel axis. Channel-axis `Concat`
+    on NCHW 4-D tensors is supported by DLA, so adding these joins does not
+    fragment the DLA partition. Decode and NMS happen externally on GPU; see
     `tools/ultralytics/examples/dla_decode.py`.
     """
 
@@ -486,13 +497,18 @@ class SegmentDLA(DetectDLA):
         return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3, mask_head=self.one2one_cv4)
 
     def forward(self, x: list[torch.Tensor]):
-        """Export: 10 raw 4-D outputs. Otherwise: standard Segment-like 3-D path."""
+        """Export: 4 packed 4-D outputs (pred_p3, pred_p4, pred_p5, proto). Otherwise: standard Segment-like 3-D path."""
         if self.export:
-            out = list(self._export_4d(x))                       # 6 tensors (box+score per scale)
-            out.append(self.proto(x[0]))                         # 1 tensor: (B, nm, 2H_P3, 2W_P3)
+            box_head = self.one2one_cv2 if self.end2end else self.cv2
+            cls_head = self.one2one_cv3 if self.end2end else self.cv3
             mask_head = self.one2one_cv4 if self.end2end else self.cv4
+            out: list[torch.Tensor] = []
             for i in range(self.nl):
-                out.append(mask_head[i](x[i]))                   # 3 tensors: (B, nm, H_i, W_i)
+                box = box_head[i](x[i])      # (B, 4*reg_max, H_i, W_i)
+                score = cls_head[i](x[i])    # (B, nc,        H_i, W_i)
+                mask = mask_head[i](x[i])    # (B, nm,        H_i, W_i)
+                out.append(torch.cat([box, score, mask], dim=1))  # (B, 4*reg_max+nc+nm, H_i, W_i)
+            out.append(self.proto(x[0]))     # (B, nm, 2*H_P3, 2*W_P3)
             return tuple(out)
         # Non-export path: Detect.forward via DetectDLA.forward, then attach proto.
         outputs = super().forward(x)
