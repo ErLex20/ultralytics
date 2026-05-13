@@ -80,6 +80,32 @@ class DFL(nn.Module):
         # return self.conv(x.view(b, self.c1, 4, a).softmax(1)).view(b, 4, a)
 
 
+class DFL4D(nn.Module):
+    """DLA-compatible DFL: operates on per-scale 4-D tensors, no 3-D reshape/transpose.
+
+    Uses 4 explicit channel-slice branches (one per regression direction) so every
+    op stays in (N,C,H,W) and is supported by NVIDIA DLA (Jetson Orin, TRT 10.x).
+    DLA may add small softmax error (NVIDIA DLA Softmax optimization); acceptable.
+    """
+
+    def __init__(self, c1: int = 16) -> None:
+        """Initialize DFL4D with c1 distribution channels."""
+        super().__init__()
+        self.c1 = c1
+        self.conv = nn.Conv2d(c1, 1, 1, bias=False)
+        self.conv.weight.data = torch.arange(c1, dtype=torch.float32).reshape(1, c1, 1, 1)
+        self.conv.requires_grad_(False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply DFL4D to a per-scale (B, 4*c1, H, W) tensor; returns (B, 4, H, W)."""
+        c = self.c1
+        d0 = self.conv(x[:, 0 * c : 1 * c].softmax(1))
+        d1 = self.conv(x[:, 1 * c : 2 * c].softmax(1))
+        d2 = self.conv(x[:, 2 * c : 3 * c].softmax(1))
+        d3 = self.conv(x[:, 3 * c : 4 * c].softmax(1))
+        return torch.cat([d0, d1, d2, d3], dim=1)  # (B, 4, H, W)
+
+
 class Proto(nn.Module):
     """Ultralytics YOLO models mask Proto module for segmentation models."""
 
@@ -1482,6 +1508,131 @@ class C2PSA(nn.Module):
 
         Returns:
             (torch.Tensor): Output tensor after processing.
+        """
+        a, b = self.cv1(x).split((self.c, self.c), dim=1)
+        b = self.m(b)
+        return self.cv2(torch.cat((a, b), 1))
+
+
+class DLAAttention(nn.Module):
+    """DLA-compatible analog of the original PSA Attention module.
+
+    Direct one-to-one translation of `Attention` (block.py:1297). Macro structure
+    is preserved — input projection → (attention branch + DWConv positional encoding
+    on V) → output projection. The only deviation from the original is the attention
+    math itself: `softmax(QᵀK) @ V` is replaced by External Attention (Guo et al.
+    2021) — `proj_attn(softmax_channel(proj_k(x)))` — which uses only 1×1 convs
+    and channel-axis softmax, all DLA-safe.
+
+    The K and V projections are two separate 1×1 convs (not a fused projection
+    followed by a channel slice). The fused-then-slice form, while functionally
+    equivalent, traces to an ONNX `Slice` chain that ships as ~10 helper
+    `Constant` / `Cast` / `ShapeTensorFromDims` ops per slice — TRT places those
+    on GPU and forces a DLA→GPU→DLA register-copy hop per scale. Two convs avoid
+    that entirely and keep the same parameter count.
+
+    Mapping from original `Attention`:
+        self.qkv[:, :nh_kd] → self.proj_k    (1×1 conv producing the K-bottleneck)
+        self.qkv[:, nh_kd:] → self.proj_v    (1×1 conv producing V)
+        QᵀK @ V            → self.proj_attn  (1×1 conv as low-rank substitute for V@attnᵀ)
+        self.pe            → self.pe         (3×3 DWConv on V, unchanged)
+        self.proj          → self.proj_out   (final 1×1 projection)
+
+    Attention is no longer data-dependent or multi-head (those require MatMul);
+    instead it's a fixed low-rank channel mixer with rank `k`.
+    """
+
+    def __init__(self, c: int, k: int | None = None) -> None:
+        """Initialize DLAAttention.
+
+        Args:
+            c (int): Input and output channels.
+            k (int | None): External-memory bottleneck dimension (analog of `nh_kd`
+                in original Attention). Defaults to `max(c // 4, 8)`.
+        """
+        super().__init__()
+        self.c = c
+        self.k_dim = k if k is not None else max(c // 4, 8)
+        self.proj_k = Conv(c, self.k_dim, 1, act=False)
+        self.proj_v = Conv(c, c, 1, act=False)
+        self.proj_attn = nn.Conv2d(self.k_dim, c, 1, bias=False)
+        self.pe = Conv(c, c, 3, g=c, act=False)
+        self.proj_out = Conv(c, c, 1, act=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass: parallel proj_k / proj_v → (EA + pe(V)) → proj_out."""
+        k = self.proj_k(x)
+        v = self.proj_v(x)
+        attn = self.proj_attn(k.softmax(dim=1))
+        return self.proj_out(attn + self.pe(v))
+
+
+class DLABlock(nn.Module):
+    """DLA-compatible analog of PSABlock: DLAAttention + FFN with residual connections.
+
+    Drop-in replacement for `PSABlock` (block.py:1357). Structurally identical —
+    `attn + ffn`, both wrapped in residuals — with `DLAAttention` substituted for
+    `Attention` so the entire block compiles to NVIDIA DLA (no MATRIX_MULTIPLY).
+    """
+
+    def __init__(self, c: int, k: int | None = None, shortcut: bool = True) -> None:
+        """Initialize DLABlock.
+
+        Args:
+            c (int): Number of channels.
+            k (int | None): EA bottleneck dim passed to DLAAttention.
+            shortcut (bool): Whether to use residual connections (matches PSABlock).
+        """
+        super().__init__()
+        self.attn = DLAAttention(c, k)
+        self.ffn = nn.Sequential(Conv(c, c * 2, 1), Conv(c * 2, c, 1, act=False))
+        self.add = shortcut
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """attn + ffn with residuals — identical to PSABlock's forward."""
+        x = x + self.attn(x) if self.add else self.attn(x)
+        x = x + self.ffn(x) if self.add else self.ffn(x)
+        return x
+
+
+class C2DLA(nn.Module):
+    """C2PSA with DLA-compatible spatial mixing (no MatMul/Attention).
+
+    Structurally identical to C2PSA — split input channels, process one half through
+    a stack of DLABlocks, then merge — but uses depthwise conv instead of QKV attention
+    so the entire module compiles to NVIDIA DLA (Jetson Orin, TensorRT 10.x) without
+    GPU fallback. Same init signature as C2PSA for easy substitution in YAML configs.
+
+    Examples:
+        >>> c2dla = C2DLA(c1=256, c2=256, n=2, e=0.5)
+        >>> x = torch.randn(1, 256, 16, 16)
+        >>> y = c2dla(x)  # shape (1, 256, 16, 16), fully DLA-compatible
+    """
+
+    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5) -> None:
+        """Initialize C2DLA module.
+
+        Args:
+            c1 (int): Input channels (must equal c2).
+            c2 (int): Output channels (must equal c1).
+            n (int): Number of DLABlock modules.
+            e (float): Expansion ratio for hidden channels.
+        """
+        super().__init__()
+        assert c1 == c2
+        self.c = int(c1 * e)
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv(2 * self.c, c1, 1)
+        self.m = nn.Sequential(*(DLABlock(self.c) for _ in range(n)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Process input through split-mix-merge: one half through DLABlocks, then concat.
+
+        Args:
+            x (torch.Tensor): Input tensor (N, C, H, W).
+
+        Returns:
+            (torch.Tensor): Output tensor (N, C, H, W).
         """
         a, b = self.cv1(x).split((self.c, self.c), dim=1)
         b = self.m(b)

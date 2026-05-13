@@ -414,6 +414,118 @@ class Segment26(Segment):
             self.proto.fuse()
 
 
+class DetectDLA(Detect):
+    """Detect head for DLA-only engines: returns raw 4-D feature maps in export mode.
+
+    Training and Python-inference paths are unchanged (standard 3-D `Detect` path).
+    Export mode emits a flat tuple of `(B, C, H_i, W_i)` tensors — 3 box maps and 3
+    score maps — so every op from input to engine output stays strictly 4-D and
+    DLA-compatible. DFL decode, dist2bbox, anchor decode, sigmoid, and NMS must be
+    done by external code on GPU after the engine returns; see
+    `tools/ultralytics/examples/dla_decode.py` for a reference implementation.
+
+    The earlier "defer-flatten-until-the-end" approach was structurally unable to
+    land the head on DLA: the final `torch.cat(..., dim=2)` produced a 3-D tensor,
+    which dragged Proto and all upstream 4-D ops back to GPU via the ForeignNode
+    fusion. Removing the decode from the engine eliminates ~200 lines of GPU-fallback
+    warnings, the `Mul` broadcast failures, and the Proto assertion failure.
+    """
+
+    def forward(self, x: list[torch.Tensor]):
+        """Export: tuple of 6 raw 4-D heads. Otherwise: standard Detect path."""
+        if self.export:
+            return self._export_4d(x)
+        return super().forward(x)
+
+    def _export_4d(self, feats: list[torch.Tensor]) -> tuple[torch.Tensor, ...]:
+        """Emit 3 box + 3 score 4-D feature maps per scale for headless DLA export.
+
+        Output order: (box_P3, score_P3, box_P4, score_P4, box_P5, score_P5),
+        all `(B, C, H_i, W_i)`.
+        """
+        box_head = self.one2one_cv2 if self.end2end else self.cv2
+        cls_head = self.one2one_cv3 if self.end2end else self.cv3
+        out: list[torch.Tensor] = []
+        for i in range(self.nl):
+            out.append(box_head[i](feats[i]))   # (B, 4*reg_max, H_i, W_i)
+            out.append(cls_head[i](feats[i]))   # (B, nc,        H_i, W_i)
+        return tuple(out)
+
+
+class SegmentDLA(DetectDLA):
+    """Segment head for DLA-only engines: returns raw 4-D feature maps in export mode.
+
+    Training and Python-inference paths mirror standard `Segment` (3-D decode on GPU).
+    Export mode emits a flat tuple of 10 `(B, C, H, W)` tensors:
+        (box_P3, score_P3, box_P4, score_P4, box_P5, score_P5, proto, mask_P3, mask_P4, mask_P5)
+    `proto` has shape `(B, nm, 2·H_P3, 2·W_P3)`; the three mask coefficient maps have
+    shape `(B, nm, H_i, W_i)`. Decode and NMS happen externally on GPU; see
+    `tools/ultralytics/examples/dla_decode.py`.
+    """
+
+    def __init__(self, nc: int = 80, nm: int = 32, npr: int = 256, reg_max: int = 16, end2end: bool = False, ch: tuple = ()):
+        """Initialize SegmentDLA with mask head (cv4) and proto."""
+        super().__init__(nc, reg_max, end2end, ch)
+        self.nm = nm
+        self.npr = npr
+        self.proto = Proto(ch[0], self.npr, self.nm)
+
+        c4 = max(ch[0] // 4, self.nm)
+        self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.nm, 1)) for x in ch)
+        if end2end:
+            self.one2one_cv4 = copy.deepcopy(self.cv4)
+
+    @property
+    def one2many(self):
+        """Returns the one-to-many head components."""
+        return dict(box_head=self.cv2, cls_head=self.cv3, mask_head=self.cv4)
+
+    @property
+    def one2one(self):
+        """Returns the one-to-one head components."""
+        return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3, mask_head=self.one2one_cv4)
+
+    def forward(self, x: list[torch.Tensor]):
+        """Export: 10 raw 4-D outputs. Otherwise: standard Segment-like 3-D path."""
+        if self.export:
+            out = list(self._export_4d(x))                       # 6 tensors (box+score per scale)
+            out.append(self.proto(x[0]))                         # 1 tensor: (B, nm, 2H_P3, 2W_P3)
+            mask_head = self.one2one_cv4 if self.end2end else self.cv4
+            for i in range(self.nl):
+                out.append(mask_head[i](x[i]))                   # 3 tensors: (B, nm, H_i, W_i)
+            return tuple(out)
+        # Non-export path: Detect.forward via DetectDLA.forward, then attach proto.
+        outputs = super().forward(x)
+        preds = outputs[1] if isinstance(outputs, tuple) else outputs
+        proto = self.proto(x[0])
+        if isinstance(preds, dict):
+            if self.end2end:
+                preds["one2many"]["proto"] = proto
+                preds["one2one"]["proto"] = proto.detach()
+            else:
+                preds["proto"] = proto
+        if self.training:
+            return preds
+        return (outputs[0], proto), preds
+
+    def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Decode boxes+scores+masks for Python inference (3-D, GPU). Mirrors Segment._inference."""
+        preds = super()._inference(x)
+        return torch.cat([preds, x["mask_coefficient"]], dim=1)
+
+    def forward_head(self, x, box_head, cls_head, mask_head=None):
+        """Concatenates and returns predicted bounding boxes, class probabilities, and mask coefficients."""
+        preds = Detect.forward_head(self, x, box_head, cls_head)
+        if mask_head is not None:
+            bs = x[0].shape[0]
+            preds["mask_coefficient"] = torch.cat([mask_head[i](x[i]).view(bs, self.nm, -1) for i in range(self.nl)], 2)
+        return preds
+
+    def fuse(self) -> None:
+        """Remove the one2many head for inference optimization."""
+        self.cv2 = self.cv3 = self.cv4 = None
+
+
 class OBB(Detect):
     """YOLO OBB detection head for detection with rotation models.
 
