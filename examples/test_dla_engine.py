@@ -20,6 +20,7 @@ Decode (DFL → dist2bbox → sigmoid) and NMS run on host GPU after the engine 
 from __future__ import annotations
 
 import argparse
+import math
 
 import cv2
 import numpy as np
@@ -83,8 +84,25 @@ def letterbox(im: np.ndarray, new_shape: int = 512, color=(114, 114, 114)):
     return padded, r, (left, top)
 
 
+def _meta(engine: trt.ICudaEngine, name: str) -> dict:
+    """Collect dtype/format/components/padded-shape for a TRT tensor."""
+    shape = tuple(engine.get_tensor_shape(name))
+    fmt = engine.get_tensor_format(name)
+    dtype = _TRT_TO_TORCH[engine.get_tensor_dtype(name)]
+    comp = engine.get_tensor_components_per_element(name)
+    vec_dim = engine.get_tensor_vectorized_dim(name)
+    padded = list(shape)
+    if vec_dim >= 0:
+        padded[vec_dim] = math.ceil(padded[vec_dim] / comp) * comp
+    n_elem = 1
+    for s in padded:
+        n_elem *= s
+    return dict(shape=shape, fmt=fmt, dtype=dtype, comp=comp, vec_dim=vec_dim,
+                padded=tuple(padded), n_elem=n_elem)
+
+
 class TRTEngine:
-    """Minimal TRT 10.x runtime wrapper sharing GPU buffers with PyTorch."""
+    """TRT 10.x wrapper that handles `dla_hwc4` input and `chw{16,32}` outputs."""
 
     def __init__(self, engine_path: str, device: str = "cuda:0"):
         self.device = torch.device(device)
@@ -102,23 +120,56 @@ class TRTEngine:
             else:
                 self.output_names.append(name)
 
-        self.outputs: dict[str, torch.Tensor] = {}
-        for name in self.output_names:
-            shape = tuple(self.engine.get_tensor_shape(name))
-            dtype = _TRT_TO_TORCH[self.engine.get_tensor_dtype(name)]
-            buf = torch.empty(shape, dtype=dtype, device=self.device)
-            self.outputs[name] = buf
-            self.context.set_tensor_address(name, buf.data_ptr())
+        self.in_meta = {n: _meta(self.engine, n) for n in self.input_names}
+        self.out_meta = {n: _meta(self.engine, n) for n in self.output_names}
+
+        print("[engine] I/O bindings:")
+        for n, m in {**self.in_meta, **self.out_meta}.items():
+            print(f"  {n:20s} logical={m['shape']} fmt={m['fmt']} dtype={m['dtype']} comp={m['comp']} vec_dim={m['vec_dim']}")
+
+        self.in_buf: dict[str, torch.Tensor] = {}
+        for n, m in self.in_meta.items():
+            self.in_buf[n] = torch.zeros(m["n_elem"], dtype=m["dtype"], device=self.device)
+            self.context.set_tensor_address(n, self.in_buf[n].data_ptr())
+
+        self.out_buf: dict[str, torch.Tensor] = {}
+        for n, m in self.out_meta.items():
+            self.out_buf[n] = torch.empty(m["n_elem"], dtype=m["dtype"], device=self.device)
+            self.context.set_tensor_address(n, self.out_buf[n].data_ptr())
+
+    def _pack_input(self, name: str, x_nchw: torch.Tensor) -> None:
+        m = self.in_meta[name]
+        x = x_nchw.to(self.device)
+        B, C, H, W = x.shape
+        if m["fmt"] == trt.TensorFormat.DLA_HWC4:
+            packed = torch.zeros((B, H, W, m["comp"]), dtype=m["dtype"], device=self.device)
+            packed[..., :C] = x.permute(0, 2, 3, 1).to(m["dtype"])
+            self.in_buf[name].copy_(packed.reshape(-1))
+        elif m["fmt"] == trt.TensorFormat.LINEAR:
+            self.in_buf[name].copy_(x.to(m["dtype"]).reshape(-1))
+        else:
+            raise NotImplementedError(f"Input format {m['fmt']} not supported")
+        self.context.set_input_shape(name, (B, C, H, W))
+
+    def _unpack_output(self, name: str) -> torch.Tensor:
+        m = self.out_meta[name]
+        B, C, H, W = m["shape"]
+        buf = self.out_buf[name]
+        if m["fmt"] in (trt.TensorFormat.CHW16, trt.TensorFormat.CHW32):
+            tiles = math.ceil(C / m["comp"])
+            t = buf.view(B, tiles, H, W, m["comp"]).permute(0, 1, 4, 2, 3).contiguous()
+            return t.view(B, tiles * m["comp"], H, W)[:, :C].float()
+        if m["fmt"] == trt.TensorFormat.LINEAR:
+            return buf.view(*m["shape"]).float()
+        raise NotImplementedError(f"Output format {m['fmt']} not supported")
 
     def infer(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        x = x.contiguous().to(self.device)
         for name in self.input_names:
-            self.context.set_input_shape(name, tuple(x.shape))
-            self.context.set_tensor_address(name, x.data_ptr())
+            self._pack_input(name, x)
         stream = torch.cuda.current_stream(self.device)
         self.context.execute_async_v3(stream.cuda_stream)
         stream.synchronize()
-        return self.outputs
+        return {n: self._unpack_output(n) for n in self.output_names}
 
 
 def _palette(n: int) -> np.ndarray:
