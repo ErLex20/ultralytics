@@ -137,11 +137,22 @@ class TRTEngine:
             self.out_buf[n] = torch.empty(m["n_elem"], dtype=m["dtype"], device=self.device)
             self.context.set_tensor_address(n, self.out_buf[n].data_ptr())
 
+    _CHW_TILED = {trt.TensorFormat.CHW2, trt.TensorFormat.CHW4,
+                  trt.TensorFormat.CHW16, trt.TensorFormat.CHW32}
+
     def _pack_input(self, name: str, x_nchw: torch.Tensor) -> None:
         m = self.in_meta[name]
         x = x_nchw.to(self.device)
         B, C, H, W = x.shape
-        if m["fmt"] == trt.TensorFormat.DLA_HWC4:
+        if m["fmt"] in self._CHW_TILED:
+            comp = m["comp"]
+            tiles = math.ceil(C / comp)
+            xp = torch.zeros((B, tiles * comp, H, W), dtype=m["dtype"], device=self.device)
+            xp[:, :C] = x.to(m["dtype"])
+            # (B, tiles, comp, H, W) -> (B, tiles, H, W, comp)
+            xp = xp.view(B, tiles, comp, H, W).permute(0, 1, 3, 4, 2).contiguous()
+            self.in_buf[name].copy_(xp.reshape(-1))
+        elif m["fmt"] == trt.TensorFormat.DLA_HWC4:
             packed = torch.zeros((B, H, W, m["comp"]), dtype=m["dtype"], device=self.device)
             packed[..., :C] = x.permute(0, 2, 3, 1).to(m["dtype"])
             self.in_buf[name].copy_(packed.reshape(-1))
@@ -155,7 +166,7 @@ class TRTEngine:
         m = self.out_meta[name]
         B, C, H, W = m["shape"]
         buf = self.out_buf[name]
-        if m["fmt"] in (trt.TensorFormat.CHW16, trt.TensorFormat.CHW32):
+        if m["fmt"] in self._CHW_TILED:
             tiles = math.ceil(C / m["comp"])
             t = buf.view(B, tiles, H, W, m["comp"]).permute(0, 1, 4, 2, 3).contiguous()
             return t.view(B, tiles * m["comp"], H, W)[:, :C].float()
