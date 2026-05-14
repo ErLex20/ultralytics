@@ -170,14 +170,32 @@ def main() -> None:
     raw = eng.infer(x)
 
     head_outs = [raw[n].float() for n in eng.output_names]
-    proto = next(t for t in head_outs if t.shape[1] == args.nm and t.ndim == 4 and t.shape[-1] != head_outs[0].shape[-1])
+    print("\n=== Engine outputs ===")
+    for name, t in zip(eng.output_names, head_outs):
+        print(f"  {name:20s} shape={tuple(t.shape)} dtype={t.dtype}  min={t.min().item():.3f}  max={t.max().item():.3f}  mean={t.mean().item():.3f}")
+
+    proto = next(t for t in head_outs if t.shape[1] == args.nm)
     pred_maps = [t for t in head_outs if t is not proto]
     pred_maps.sort(key=lambda t: -t.shape[-1])  # P3, P4, P5
+    print(f"\n  proto: shape={tuple(proto.shape)}")
+    print(f"  pred_maps (P3,P4,P5): {[tuple(p.shape) for p in pred_maps]}")
 
     strides = torch.tensor([args.imgsz / p.shape[-1] for p in pred_maps],
                            device=pred_maps[0].device, dtype=pred_maps[0].dtype)
+    print(f"  strides={strides.tolist()}")
     dets, mask_coeff = decode_heads(pred_maps, strides, args.reg_max, args.nc, args.nm)
     preds = torch.cat([dets, mask_coeff], dim=1)
+
+    cls_scores = preds[:, 4:4 + args.nc]
+    max_per_anchor = cls_scores.amax(1)[0]
+    topk = max_per_anchor.topk(min(10, max_per_anchor.numel()))
+    print(f"\n=== Score stats (after sigmoid) ===")
+    print(f"  max={max_per_anchor.max().item():.4f}  mean={max_per_anchor.mean().item():.4f}")
+    print(f"  top-10 anchor scores: {[f'{v:.3f}' for v in topk.values.tolist()]}")
+    print(f"  #anchors > 0.001 : {(max_per_anchor > 0.001).sum().item()}")
+    print(f"  #anchors > 0.05  : {(max_per_anchor > 0.05).sum().item()}")
+    print(f"  #anchors > {args.conf:.2f} : {(max_per_anchor > args.conf).sum().item()}")
+
     nms_out = non_max_suppression(preds, conf_thres=args.conf, iou_thres=args.iou, nc=args.nc)[0]
 
     if nms_out is None or nms_out.numel() == 0:
