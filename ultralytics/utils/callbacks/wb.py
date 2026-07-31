@@ -1,6 +1,6 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
-from ultralytics.utils import SETTINGS, TESTS_RUNNING
+from ultralytics.utils import LOGGER, SETTINGS, TESTS_RUNNING
 from ultralytics.utils.torch_utils import model_info_for_loggers
 
 try:
@@ -125,6 +125,33 @@ def _log_plots(plots, step):
             _processed_plots[name] = timestamp
 
 
+def _wandb_run_id(latest_run):
+    """Recover a W&B run ID from a latest-run symlink or directory."""
+    resolved = latest_run.resolve()
+    target_name = resolved.name
+
+    # Standard W&B directories are named run-<timestamp>-<id> or offline-run-<timestamp>-<id>.
+    for prefix in ("run-", "offline-run-"):
+        if target_name.startswith(prefix):
+            run_id = target_name.rsplit("-", 1)[-1]
+            if run_id and run_id != target_name:
+                return run_id
+
+    # Some W&B versions leave latest-run as a directory. Its binary run file is named run-<id>.wandb.
+    run_files = sorted(
+        resolved.glob("run-*.wandb"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if run_files:
+        return run_files[0].stem.removeprefix("run-")
+
+    # Support symlinks to directories named directly after a custom run ID.
+    if latest_run.is_symlink() and target_name != latest_run.name:
+        return target_name
+    return None
+
+
 def on_pretrain_routine_start(trainer):
     """Initialize and start wandb project if module is present."""
     if not wb.run:
@@ -133,15 +160,18 @@ def on_pretrain_routine_start(trainer):
 
         name = str(trainer.args.name).replace("/", "-").replace(" ", "_")
         latest_run = Path(trainer.save_dir) / "wandb" / "latest-run"
-        resuming = trainer.args.resume and latest_run.exists()
+        resume_id = _wandb_run_id(latest_run) if trainer.args.resume and latest_run.exists() else None
+        if trainer.args.resume and latest_run.exists() and resume_id is None:
+            LOGGER.warning(
+                f"W&B run ID could not be recovered from {latest_run}; "
+                "starting a new W&B run while keeping the YOLO checkpoint resume."
+            )
         wb.init(
             project=str(trainer.args.project).replace("/", "-") if trainer.args.project else "Ultralytics",
             name=name,
             config=vars(trainer.args),
-            id=latest_run.resolve().name.split("-", 2)[2]
-            if resuming
-            else f"{name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-            resume="allow" if resuming else None,
+            id=resume_id or f"{name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            resume="allow" if resume_id else None,
             dir=str(trainer.save_dir),
         )
 
