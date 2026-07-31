@@ -156,18 +156,23 @@ def on_pretrain_routine_start(trainer):
     """Initialize and start wandb project if module is present."""
     if not wb.run:
         from datetime import datetime
+        from os import getenv
         from pathlib import Path
 
-        name = str(trainer.args.name).replace("/", "-").replace(" ", "_")
+        name = getenv("WANDB_NAME") or str(trainer.args.name).replace("/", "-").replace(" ", "_")
         latest_run = Path(trainer.save_dir) / "wandb" / "latest-run"
-        resume_id = _wandb_run_id(latest_run) if trainer.args.resume and latest_run.exists() else None
+        configured_id = getenv("WANDB_RUN_ID")
+        recovered_id = _wandb_run_id(latest_run) if trainer.args.resume and latest_run.exists() else None
+        resume_id = configured_id or recovered_id
         if trainer.args.resume and latest_run.exists() and resume_id is None:
             LOGGER.warning(
                 f"W&B run ID could not be recovered from {latest_run}; "
                 "starting a new W&B run while keeping the YOLO checkpoint resume."
             )
         wb.init(
-            project=str(trainer.args.project).replace("/", "-") if trainer.args.project else "Ultralytics",
+            entity=getenv("WANDB_ENTITY"),
+            project=getenv("WANDB_PROJECT")
+            or (str(trainer.args.project).replace("/", "-") if trainer.args.project else "Ultralytics"),
             name=name,
             config=vars(trainer.args),
             id=resume_id or f"{name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
