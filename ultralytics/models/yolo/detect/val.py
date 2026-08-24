@@ -118,7 +118,7 @@ class DetectionValidator(BaseValidator):
 
         preds = decode_dla_backend_outputs(
             preds,
-            self.model,
+            getattr(self, "model", None),
             max_det=self.args.max_det,
             agnostic=self.args.single_cls or self.args.agnostic_nms,
         )

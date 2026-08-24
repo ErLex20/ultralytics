@@ -36,7 +36,7 @@ class DLARepCSP(nn.Module):
         self.short = Conv(c1, hidden, 1, 1)
         self.main = Conv(c1, hidden, 1, 1)
         self.blocks = nn.Sequential(
-            *(RepConv(hidden, hidden, 3, 1, bn=True, act=nn.ReLU(inplace=True)) for _ in range(n))
+            *(RepConv(hidden, hidden, 3, 1, bn=True, act=Conv.default_act) for _ in range(n))
         )
         self.fuse = Conv(2 * hidden, c2, 1, 1)
 
@@ -104,23 +104,25 @@ class YOLODLADetect(DetectDLA):
     required by the deployment decoder.
     """
 
+    tower_reps = 2  # RepConv units per tower (ablation knob)
+    cls_width = None  # classification tower width; None uses max(64, min(nc, 128))
+
     def __init__(self, nc: int = 80, reg_max: int = 1, end2end: bool = True, ch: tuple = ()) -> None:
         """Initialize hardware-aligned box and classification towers."""
         super().__init__(nc, reg_max, end2end, ch)
         box_channels = max(32, ch[0] // 2, 4 * reg_max)
-        cls_channels = max(64, min(nc, 128))
+        cls_channels = self.cls_width or max(64, min(nc, 128))
         self.cv2 = nn.ModuleList(self._make_tower(x, box_channels, 4 * reg_max) for x in ch)
         self.cv3 = nn.ModuleList(self._make_tower(x, cls_channels, nc) for x in ch)
         if end2end:
             self.one2one_cv2 = copy.deepcopy(self.cv2)
             self.one2one_cv3 = copy.deepcopy(self.cv3)
 
-    @staticmethod
-    def _make_tower(c1: int, hidden: int, c2: int) -> nn.Sequential:
+    @classmethod
+    def _make_tower(cls, c1: int, hidden: int, c2: int) -> nn.Sequential:
         """Build a train-time RepConv tower that becomes plain convolutions after fusion."""
         return nn.Sequential(
             Conv(c1, hidden, 1, 1),
-            RepConv(hidden, hidden, 3, 1, bn=True, act=nn.ReLU(inplace=True)),
-            RepConv(hidden, hidden, 3, 1, bn=True, act=nn.ReLU(inplace=True)),
+            *(RepConv(hidden, hidden, 3, 1, bn=True, act=Conv.default_act) for _ in range(cls.tower_reps)),
             nn.Conv2d(hidden, c2, 1),
         )
