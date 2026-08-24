@@ -97,9 +97,18 @@ class BaseBackend(ABC):
 
         # Process type conversions for known fields
         for k, v in metadata.items():
-            if k in {"stride", "batch", "channels"}:
+            if k in {"stride", "batch", "channels", "dla_outputs", "reg_max", "nm"}:
                 metadata[k] = int(v)
-            elif k in {"imgsz", "names", "kpt_shape", "kpt_names", "args", "end2end"} and isinstance(v, str):
+            elif k in {
+                "imgsz",
+                "names",
+                "kpt_shape",
+                "kpt_names",
+                "args",
+                "end2end",
+                "dla_raw",
+                "dla_strides",
+            } and isinstance(v, str):
                 metadata[k] = ast.literal_eval(v)
 
         # Handle models exported with end-to-end NMS

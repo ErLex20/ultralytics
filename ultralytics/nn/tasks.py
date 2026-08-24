@@ -49,6 +49,8 @@ from ultralytics.nn.modules import (
     DetectDLA,
     DWConv,
     DWConvTranspose2d,
+    DLALocalContext,
+    DLARepCSP,
     Focus,
     GhostBottleneck,
     GhostConv,
@@ -72,6 +74,7 @@ from ultralytics.nn.modules import (
     TorchVision,
     WorldDetect,
     YOLOEDetect,
+    YOLODLADetect,
     YOLOESegment,
     YOLOESegment26,
     v10Detect,
@@ -1596,6 +1599,8 @@ def parse_model(d, ch, verbose=True):
             SPP,
             SPPF,
             C2DLA,
+            DLALocalContext,
+            DLARepCSP,
             C2fPSA,
             C2PSA,
             DWConv,
@@ -1638,6 +1643,8 @@ def parse_model(d, ch, verbose=True):
             C3x,
             RepC3,
             C2DLA,
+            DLALocalContext,
+            DLARepCSP,
             C2fPSA,
             C2fCIB,
             C2PSA,
@@ -1697,6 +1704,7 @@ def parse_model(d, ch, verbose=True):
             {
                 Detect,
                 DetectDLA,
+                YOLODLADetect,
                 WorldDetect,
                 YOLOEDetect,
                 Segment,
@@ -1713,7 +1721,21 @@ def parse_model(d, ch, verbose=True):
             args.extend([reg_max, end2end, [ch[x] for x in f]])
             if m in {Segment, YOLOESegment, Segment26, YOLOESegment26, SegmentDLA}:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, DetectDLA, YOLOEDetect, Segment, Segment26, SegmentDLA, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26}:
+            if m in {
+                Detect,
+                DetectDLA,
+                YOLODLADetect,
+                YOLOEDetect,
+                Segment,
+                Segment26,
+                SegmentDLA,
+                YOLOESegment,
+                YOLOESegment26,
+                Pose,
+                Pose26,
+                OBB,
+                OBB26,
+            }:
                 m.legacy = legacy
         elif m is v10Detect:
             args.append([ch[x] for x in f])
@@ -1766,7 +1788,7 @@ def yaml_model_load(path):
     unified_path = re.sub(r"(\d+)([nslmx])(.+)?$", r"\1\3", str(path))  # i.e. yolov8x.yaml -> yolov8.yaml
     yaml_file = check_yaml(unified_path, hard=False) or check_yaml(path)
     d = YAML.load(yaml_file)  # model dict
-    d["scale"] = guess_model_scale(path)
+    d["scale"] = guess_model_scale(path) or d.get("scale")
     d["yaml_file"] = str(path)
     return d
 

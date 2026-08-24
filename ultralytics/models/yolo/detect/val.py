@@ -114,6 +114,14 @@ class DetectionValidator(BaseValidator):
             (list[dict[str, torch.Tensor]]): Processed predictions after NMS, where each dict contains 'bboxes', 'conf',
                 'cls', and 'extra' tensors.
         """
+        from ultralytics.utils.dla import decode_dla_backend_outputs
+
+        preds = decode_dla_backend_outputs(
+            preds,
+            self.model,
+            max_det=self.args.max_det,
+            agnostic=self.args.single_cls or self.args.agnostic_nms,
+        )
         outputs = nms.non_max_suppression(
             preds,
             self.args.conf,

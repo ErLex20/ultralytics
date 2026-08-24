@@ -99,6 +99,14 @@ class SegmentationValidator(DetectionValidator):
         Returns:
             (list[dict[str, torch.Tensor]]): Processed detection predictions with masks.
         """
+        from ultralytics.utils.dla import decode_dla_backend_outputs
+
+        preds = decode_dla_backend_outputs(
+            preds,
+            self.model,
+            max_det=self.args.max_det,
+            agnostic=self.args.single_cls or self.args.agnostic_nms,
+        )
         proto = preds[0][1] if isinstance(preds[0], tuple) else preds[1]
         preds = super().postprocess(preds[0])
         imgsz = [4 * x for x in proto.shape[2:]]  # get image size from proto

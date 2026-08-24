@@ -348,7 +348,8 @@ class Exporter:
                 # Disable end2end branch for certain export formats as they does not support topk
                 model.end2end = False
                 LOGGER.warning(f"{fmt.upper()} export does not support end2end models, disabling end2end branch.")
-            if fmt == "engine" and self.args.int8:
+            # Raw DLA heads bypass in-engine TopK, so the JetPack 6 TopK workaround does not apply to them.
+            if fmt == "engine" and self.args.int8 and not isinstance(model.model[-1], DetectDLA):
                 # TensorRT 10.3.0 on JetPack 6 with int8 has known end2end build issues
                 # https://github.com/ultralytics/ultralytics/issues/23841
                 try:
@@ -512,6 +513,18 @@ class Exporter:
             "channels": model.yaml.get("channels", 3),
             "end2end": getattr(model, "end2end", False),
         }  # model metadata
+        head = model.model[-1] if hasattr(model, "model") else None
+        if isinstance(head, DetectDLA):
+            self.metadata.update(
+                {
+                    "dla_raw": True,
+                    "dla_outputs": head.nl,
+                    "dla_strides": head.stride.tolist(),
+                    "reg_max": head.reg_max,
+                }
+            )
+            if hasattr(head, "nm"):
+                self.metadata["nm"] = head.nm
         if self.dla is not None:
             self.metadata["dla"] = self.dla  # make sure `AutoBackend` uses correct dla device if it has one
         if model.task == "pose":

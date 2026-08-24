@@ -97,6 +97,7 @@ from .head import (
     YOLOESegment26,
     v10Detect,
 )
+from .yolo_dla import DLALocalContext, DLARepCSP, YOLODLADetect
 from .transformer import (
     AIFI,
     MLP,
@@ -122,6 +123,8 @@ __all__ = (
     "CIB",
     "DFL",
     "DFL4D",
+    "DLALocalContext",
+    "DLARepCSP",
     "ELAN1",
     "MLP",
     "OBB",
@@ -192,6 +195,7 @@ __all__ = (
     "TransformerLayer",
     "WorldDetect",
     "YOLOEDetect",
+    "YOLODLADetect",
     "YOLOESegment",
     "YOLOESegment26",
     "v10Detect",

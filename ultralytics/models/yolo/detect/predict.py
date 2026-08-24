@@ -50,6 +50,14 @@ class DetectionPredictor(BasePredictor):
             >>> results = predictor.predict("path/to/image.jpg")
             >>> processed_results = predictor.postprocess(preds, img, orig_imgs)
         """
+        from ultralytics.utils.dla import decode_dla_backend_outputs
+
+        preds = decode_dla_backend_outputs(
+            preds,
+            self.model,
+            max_det=self.args.max_det,
+            agnostic=self.args.agnostic_nms,
+        )
         save_feats = getattr(self, "_feats", None) is not None
         preds = nms.non_max_suppression(
             preds,

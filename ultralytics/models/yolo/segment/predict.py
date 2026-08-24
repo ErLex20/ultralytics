@@ -61,6 +61,14 @@ class SegmentationPredictor(DetectionPredictor):
             >>> predictor = SegmentationPredictor(overrides=dict(model="yolo26n-seg.pt"))
             >>> results = predictor.postprocess(preds, img, orig_img)
         """
+        from ultralytics.utils.dla import decode_dla_backend_outputs
+
+        preds = decode_dla_backend_outputs(
+            preds,
+            self.model,
+            max_det=self.args.max_det,
+            agnostic=self.args.agnostic_nms,
+        )
         # Extract protos - tuple if PyTorch model or array if exported
         protos = preds[0][1] if isinstance(preds[0], tuple) else preds[1]
         return super().postprocess(preds[0], img, orig_imgs, protos=protos)
